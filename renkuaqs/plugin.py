@@ -18,26 +18,35 @@
 
 import os
 import pathlib
-import re
-import sys
 import json
+import webbrowser
 import click
 import rdflib
-from copy import deepcopy
-from pathlib import Path
+import rdflib.tools.rdf2dot
+import time
+import yaml
 
-from renku.core.models.cwl.annotation import Annotation
-from renku.core.incubation.command import Command
+from pathlib import Path
+from pyvis.network import Network
+from rdflib.tools import rdf2dot
+from renku.core.models.provenance.annotation import Annotation
+from renku.core.management.command_builder import Command, inject
+from renku.core.management.interface.client_dispatcher import IClientDispatcher
 from renku.core.plugins import hookimpl
-from renku.core.models.provenance.provenance_graph import ProvenanceGraph
+from renku.core.commands.format.graph import _conjunctive_graph
 from renku.core.errors import RenkuException
-from renku.core.management import LocalClient
+from renku.core.management.client import LocalClient
+
+from renku.core.commands.graph import _get_graph_for_all_objects
 
 from prettytable import PrettyTable
-from deepdiff import DeepDiff
-
-#from aqsconverters.models import Run
 from aqsconverters.io import AQS_DIR, COMMON_DIR
+
+import renkuaqs.graph_utils as graph_utils
+
+# TODO improve this
+__this_dir__ = os.path.join(os.path.abspath(os.path.dirname(__file__)))
+graph_configuration = yaml.load(open(os.path.join(__this_dir__, "graph_config.yaml")), Loader=yaml.SafeLoader)
 
 
 class AQS(object):
@@ -45,9 +54,10 @@ class AQS(object):
         self.run = run
 
     @property
-    def renku_aqs_path(self):
-        """Return a ``Path`` instance of Renku AQS metadata folder."""        
-        return Path(self.run.client.renku_home).joinpath(AQS_DIR).joinpath(COMMON_DIR)
+    @inject.autoparams("client_dispatcher")
+    def renku_aqs_path(self, client_dispatcher: IClientDispatcher):
+        """Return a ``Path`` instance of Renku AQS metadata folder."""
+        return Path(client_dispatcher.current_client.renku_home).joinpath(AQS_DIR).joinpath(COMMON_DIR)
 
     def load_model(self, path):
         """Load AQS reference file."""
@@ -57,9 +67,9 @@ class AQS(object):
 
 
 @hookimpl
-def process_run_annotations(run):
+def activity_annotations(activity):
     """``process_run_annotations`` hook implementation."""
-    aqs = AQS(run)
+    aqs = AQS(activity)
 
     #os.remove(os.path.join(aqs.renku_aqs_path, "site.py"))
 
@@ -79,13 +89,12 @@ def process_run_annotations(run):
         
             elif p.match("*jsonld"):
                 print(f"found jsonLD annotation: {p}\n", json.dumps(json.load(p.open()), sort_keys=True, indent=4))
-                
 
                 # this will make annotations according to https://odahub.io/ontology/
                 aqs_annotation = aqs.load_model(p)
                 model_id = aqs_annotation["@id"]
                 annotation_id = "{activity}/annotations/aqs/{id}".format(
-                    activity=run._id, id=model_id
+                    activity=activity.id, id=model_id
                 )
                 p.unlink()
                 annotations.append(
@@ -95,6 +104,7 @@ def process_run_annotations(run):
         print("nothing to process in process_run_annotations")
 
     return annotations
+
 
 @hookimpl
 def pre_run(tool):
@@ -118,32 +128,32 @@ aqsconverters.aq.autolog()
 
     from astroquery.query import BaseQuery # ??
 
+
 def _run_id(activity_id):
     return str(activity_id).split("/")[-1]
 
 
-def _load_provenance_graph(client):
-    if not client.provenance_graph_path.exists():
-        raise RenkuException(
-            """Provenance graph has not been generated!
-Please run 'renku graph generate' to create the project's provenance graph
-"""
-        )
-    return ProvenanceGraph.from_json(client.provenance_graph_path)
+def _export_graph():
+    graph = _get_graph_for_all_objects()
+
+    return graph
 
 
 def _graph(revision, paths):
     # FIXME: use (revision, paths) filter
-    cmd_result = Command().command(_load_provenance_graph).build().execute()
 
-    provenance_graph = cmd_result.output
-    provenance_graph.custom_bindings = {
-        "aqs": "http://www.w3.org/ns/aqs#",
-        "oa": "http://www.w3.org/ns/oa#",
-        "xsd": "http://www.w3.org/2001/XAQSchema#",
-    }
+    cmd = Command().command(_export_graph).with_database(write=False).require_migration()
+    cmd_result = cmd.build().execute()
 
-    return provenance_graph
+    if cmd_result.status == cmd_result.FAILURE:
+        raise RenkuException("fail to export the renku graph")
+    graph = _conjunctive_graph(cmd_result.output)
+
+    graph.bind("aqs", "http://www.w3.org/ns/aqs#")
+    graph.bind("oa", "http://www.w3.org/ns/oa#")
+    graph.bind("xsd", "http://www.w3.org/2001/XAQSchema#")
+
+    return graph
 
 
 def renku_context():
@@ -193,34 +203,6 @@ def leaderboard(revision, format, metric, paths):
         }}"""):
 
         print(r)
-    # for r in graph.query(
-    #     """SELECT DISTINCT ?type ?value ?run ?runId ?dsPath where {{
-    #     ?em a aqs:ModelEvaluation ;
-    #     aqs:hasValue ?value ;
-    #     aqs:specifiedBy ?type ;
-    #     ^aqs:hasOutput/aqs:implements/rdfs:label ?run ;
-    #     ^aqs:hasOutput/^oa:hasBody/oa:hasTarget ?runId ;
-    #     ^aqs:hasOutput/^oa:hasBody/oa:hasTarget/prov:qualifiedUsage/prov:entity/prov:atLocation ?dsPath
-    #     }}"""
-    #     run_id = _run_id(r.runId)
-    #     metric_type = r.type.split("#")[1]
-    #     if run_id in leaderboard:
-    #         leaderboard[run_id]["inputs"].append(r.dsPath.__str__())
-    #         continue
-    #     leaderboard[run_id] = {
-    #         metric_type: r.value.value,
-    #         "model": r.run,
-    #         "inputs": [r.dsPath.__str__()],
-    #     }
-    # if len(paths):
-    #     filtered_board = dict()
-    #     for path in paths:
-    #         filtered_board.update(
-    #             dict(filter(lambda x: path in x[1]["inputs"], leaderboard.items()))
-    #         )
-    #     print(_create_leaderboard(filtered_board, metric))
-    # else:
-    #     print(_create_leaderboard(leaderboard, metric))
 
 
 @aqs.command()
@@ -249,19 +231,21 @@ def params(revision, format, paths, diff):
 
     renku_path = renku_context().renku_path
 
-    # model_params = dict()
-   # how to use ontology
+    # how to use ontology
     output = PrettyTable()
     output.field_names = ["Run ID", "AstroQuery Module", "Astro Object"]
     output.align["Run ID"] = "l"
 
+    # for the query_object
     query_where = """WHERE {{
-        ?run <http://odahub.io/ontology#isRequestingAstroObject> ?a_object;
-             <http://odahub.io/ontology#isUsing> ?aq_module;
+        ?run <http://odahub.io/ontology#isUsing> ?aq_module ;
+             <http://odahub.io/ontology#isRequestingAstroObject> ?a_object ;
              ^oa:hasBody/oa:hasTarget ?runId .
+        
+        OPTIONAL {{ ?run <http://purl.org/dc/terms/title> ?run_title . }}
 
         ?a_object <http://purl.org/dc/terms/title> ?a_object_name .
-
+        
         ?aq_module <http://purl.org/dc/terms/title> ?aq_module_name .
 
         ?run ?p ?o .
@@ -271,7 +255,7 @@ def params(revision, format, paths, diff):
     invalid_entries = 0
 
     for r in graph.query(f"""
-        SELECT DISTINCT ?run ?runId ?a_object ?a_object_name ?aq_module ?aq_module_name
+        SELECT DISTINCT ?run ?runId ?a_object ?a_object_name ?aq_module ?aq_module_name 
         {query_where}
         """):
         if " " in r.a_object:
@@ -280,7 +264,71 @@ def params(revision, format, paths, diff):
             output.add_row([
                 _run_id(r.runId),
                 r.aq_module_name,
-                r.a_object_name,
+                r.a_object_name
+            ])
+    print(output, "\n")
+
+    # for the query_region
+    query_where = """WHERE {{
+        ?run <http://odahub.io/ontology#isUsing> ?aq_module ;
+             <http://odahub.io/ontology#isRequestingAstroRegion> ?a_region ;
+             ^oa:hasBody/oa:hasTarget ?runId .
+        
+        OPTIONAL {{ ?run <http://purl.org/dc/terms/title> ?run_title . }}
+
+        ?a_region <http://purl.org/dc/terms/title> ?a_region_name .
+        
+        ?aq_module <http://purl.org/dc/terms/title> ?aq_module_name .
+
+        ?run ?p ?o .
+    }}"""
+
+    output = PrettyTable()
+    output.field_names = ["Run ID", "AstroQuery Module", "Astro Region"]
+    output.align["Run ID"] = "l"
+    for r in graph.query(f"""
+        SELECT DISTINCT ?run ?runId ?a_region ?a_region_name ?aq_module ?aq_module_name 
+        {query_where}
+        """):
+        if " " in r.a_region:
+            invalid_entries += 1
+        else:
+            output.add_row([
+                _run_id(r.runId),
+                r.aq_module_name,
+                r.a_region_name
+            ])
+    print(output, "\n")
+
+    # for the get_images
+    query_where = """WHERE {{
+        ?run <http://odahub.io/ontology#isUsing> ?aq_module ;
+             <http://odahub.io/ontology#isRequestingAstroImage> ?a_image ;
+             ^oa:hasBody/oa:hasTarget ?runId .
+
+        OPTIONAL {{ ?run <http://purl.org/dc/terms/title> ?run_title . }}
+
+        ?a_image <http://purl.org/dc/terms/title> ?a_image_name .
+
+        ?aq_module <http://purl.org/dc/terms/title> ?aq_module_name .
+
+        ?run ?p ?o .
+    }}"""
+
+    output = PrettyTable()
+    output.field_names = ["Run ID", "AstroQuery Module", "Astro Image"]
+    output.align["Run ID"] = "l"
+    for r in graph.query(f"""
+        SELECT DISTINCT ?run ?runId ?a_image ?a_image_name ?aq_module ?aq_module_name 
+        {query_where}
+        """):
+        if " " in r.a_image:
+            invalid_entries += 1
+        else:
+            output.add_row([
+                _run_id(r.runId),
+                r.aq_module_name,
+                r.a_image_name
             ])
 
     print(output, "\n")
@@ -288,29 +336,86 @@ def params(revision, format, paths, diff):
         print("Some entries within the graph are not valid and therefore the store should be recreated", "\n")
 
     query_where = """WHERE {{
-            ?run <http://odahub.io/ontology#isRequestingAstroObject> ?a_object;
-                 <http://odahub.io/ontology#isUsing> ?aq_module;
-                 ^oa:hasBody/oa:hasTarget ?runId .
+            {
+                ?run <http://odahub.io/ontology#isUsing> ?aq_module ;
+                     <http://odahub.io/ontology#isRequestingAstroObject> ?a_object ;
+                     ^oa:hasBody/oa:hasTarget ?runId .
+                 
+                ?a_object <http://purl.org/dc/terms/title> ?a_object_name .
+                
+                ?aq_module <http://purl.org/dc/terms/title> ?aq_module_name .
+                
+                OPTIONAL {{ ?run <http://purl.org/dc/terms/title> ?run_title . }}
+                
+                ?run ?p ?o .
 
-            ?a_object <http://purl.org/dc/terms/title> ?a_object_name .
+                FILTER (!CONTAINS(str(?a_object), " ")) .
+            
+            }
+            UNION
+            {
+                ?run <http://odahub.io/ontology#isUsing> ?aq_module ;
+                     <http://odahub.io/ontology#isRequestingAstroRegion> ?a_region ;
+                     ^oa:hasBody/oa:hasTarget ?runId .
+                
+                ?a_region a ?a_region_type ; 
+                    <http://purl.org/dc/terms/title> ?a_region_name ;
+                    <http://odahub.io/ontology#isUsingSkyCoordinates> ?a_sky_coordinates ;
+                    <http://odahub.io/ontology#isUsingRadius> ?a_radius .
+                
+                ?aq_module <http://purl.org/dc/terms/title> ?aq_module_name .
 
-            ?aq_module <http://purl.org/dc/terms/title> ?aq_module_name .
+                OPTIONAL {{ ?run <http://purl.org/dc/terms/title> ?run_title . }}
+                
+                ?run ?p ?o .
+            }
+            UNION
+            {
+                ?run <http://odahub.io/ontology#isUsing> ?aq_module ;
+                     <http://odahub.io/ontology#isRequestingAstroImage> ?a_image ;
+                     ^oa:hasBody/oa:hasTarget ?runId .
 
-            ?run ?p ?o .
+                ?aq_module <http://purl.org/dc/terms/title> ?aq_module_name .
 
-            FILTER (!CONTAINS(str(?a_object), " ")) .
+                ?a_image a ?a_image_type ;
+                        <http://purl.org/dc/terms/title> ?a_image_name .
 
+                OPTIONAL {{ ?a_image <http://odahub.io/ontology#isUsingCoordinates> ?a_coordinates . }}
+                OPTIONAL {{ ?a_image <http://odahub.io/ontology#isUsingPosition> ?a_position . }}
+                OPTIONAL {{ ?a_image <http://odahub.io/ontology#isUsingRadius> ?a_radius . }}
+                OPTIONAL {{ ?a_image <http://odahub.io/ontology#isUsingPixels> ?a_pixels . }}
+                OPTIONAL {{ ?a_image <http://odahub.io/ontology#isUsingImageBand> ?a_image_band . }}
+
+                OPTIONAL {{ ?run <http://purl.org/dc/terms/title> ?run_title . }}
+
+                ?run ?p ?o .
+            }
             }}"""
 
     r = graph.query(f"""
         CONSTRUCT {{
             ?run <http://odahub.io/ontology#isRequestingAstroObject> ?a_object .
+            ?run <http://odahub.io/ontology#isRequestingAstroRegion> ?a_region .
+            ?run <http://odahub.io/ontology#isRequestingAstroImage> ?a_image .
+            ?run <http://purl.org/dc/terms/title> ?run_title .
             ?run <http://odahub.io/ontology#isUsing> ?aq_module .
             ?run ?p ?o .
+            
+            ?a_region a ?a_region_type ; 
+                <http://purl.org/dc/terms/title> ?a_region_name ;
+                <http://odahub.io/ontology#isUsingSkyCoordinates> ?a_sky_coordinates ;
+                <http://odahub.io/ontology#isUsingRadius> ?a_radius .
+                
+            ?a_image a ?a_image_type ;
+                <http://purl.org/dc/terms/title> ?a_image_name ;
+                <http://odahub.io/ontology#isUsingCoordinates> ?a_coordinates ;
+                <http://odahub.io/ontology#isUsingPosition> ?a_position ;
+                <http://odahub.io/ontology#isUsingRadius> ?a_radius ;
+                <http://odahub.io/ontology#isUsingPixels> ?a_pixels ;
+                <http://odahub.io/ontology#isUsingImageBand> ?a_image_band .
         }}
         {query_where}
         """)
-
 
     G = rdflib.Graph()
     G.parse(data=r.serialize(format="n3").decode(), format="n3")
@@ -318,78 +423,173 @@ def params(revision, format, paths, diff):
     G.bind("odas", "https://odahub.io/ontology#")   # the same
     G.bind("local-renku", f"file://{renku_path}/") #??
 
-    serial = G.serialize(format="n3").decode()
 
-    print(serial)
+@aqs.command()
+@click.option(
+    "--revision",
+    default="HEAD",
+    help="The git revision to generate the log for, default: HEAD",
+)
+@click.option("--filename", default="graph.png", help="The filename of the output file image")
+@click.option("--input-notebook", default=None, help="Input notebook to process")
+@click.option("--no-oda-info", is_flag=True, help="Exclude oda related information in the output graph")
+@click.argument("paths", type=click.Path(exists=False), nargs=-1)
+def display(revision, paths, filename, no_oda_info, input_notebook):
+    """Simple graph visualization """
+    import io
+    from IPython.display import display
+    import pydotplus
 
-    with open("subgraph.ttl", "w") as f:
-        f.write(serial)
+    graph = _graph(revision, paths)
 
-    #TODO: do construct and ingest into ODA KG
-    #TODO: plot construct
+    html_fn = 'graph.html'
+    renku_path = renku_context().renku_path
 
-    #     output.field_names = ["Run ID", "Model", "Hyper-Parameters"]
-    #     output.align["Run ID"] = "l"
-    #     output.align["Model"] = "l"
-    #     output.align["Hyper-Parameters"] = "l"
-    #     for runid, v in model_params.items():
-    #         output.add_row([runid, v["algorithm"], json.dumps(v["hp"])])
-    #     print(output)
+    query_where = graph_utils.build_query_where(input_notebook=input_notebook)
+    # query_construct = graph_utils.build_query_construct(input_notebook=input_notebook, no_oda_info=no_oda_info)
+    query_construct = graph_utils.build_query_construct_base_graph()
 
-    # for r in graph.query(
-    #     """SELECT ?runId ?algo ?hp ?value where {{
-    #     ?run a aqs:Run ;
-    #     aqs:hasInput ?in .
-    #     ?in a aqs:HyperParameterSetting .
-    #     ?in aqs:specifiedBy/rdfs:label ?hp .
-    #     ?in aqs:hasValue ?value .
-    #     ?run aqs:implements/rdfs:label ?algo ;
-    #     ^oa:hasBody/oa:hasTarget ?runId
-    #     }}"""
-    # # ):
-    #     run_id = _run_id(r.runId)
-    #     if run_id in model_params:
-    #         model_params[run_id]["hp"][str(r.hp)] = _param_value(r.value)
-    #     else:
-    #         model_params[run_id] = dict(
-    #             {"algorithm": str(r.algo), "hp": {str(r.hp): _param_value(r.value)}}
-    #         )
+    query = f"""{query_construct}
+        {query_where}
+        """
 
-    # if len(diff) > 0:
-    #     for r in diff:
-    #         if r not in model_params:
-    #             print("Unknown revision provided for diff parameter: {}".format(r))
-    #             return
-    #     if model_params[diff[0]]["algorithm"] != model_params[diff[1]]["algorithm"]:
-    #         print("Model:")
-    #         print("\t- {}".format(model_params[diff[0]]["algorithm"]))
-    #         print("\t+ {}".format(model_params[diff[1]]["algorithm"]))
-    #     else:
-    #         params_diff = DeepDiff(
-    #             model_params[diff[0]], model_params[diff[1]], ignore_order=True
-    #         )
-    #         output = PrettyTable()
-    #         output.field_names = ["Hyper-Parameter", "Old", "New"]
-    #         output.align["Hyper-Parameter"] = "l"
-    #         if "values_changed" not in params_diff:
-    #             print(output)
-    #             return
-    #         for k, v in params_diff["values_changed"].items():
-    #             parameter_name = re.search(r"\['(\w+)'\]$", k).group(1)
-    #             output.add_row(
-    #                 [
-    #                     parameter_name,
-    #                     _param_value(v["new_value"]),
-    #                     _param_value(v["old_value"]),
-    #                 ]
-    #             )
-    #         print(output)
-    # else:
-    #     output = PrettyTable()
-    #     output.field_names = ["Run ID", "Model", "Hyper-Parameters"]
-    #     output.align["Run ID"] = "l"
-    #     output.align["Model"] = "l"
-    #     output.align["Hyper-Parameters"] = "l"
-    #     for runid, v in model_params.items():
-    #         output.add_row([runid, v["algorithm"], json.dumps(v["hp"])])
-    #     print(output)
+    print("Before starting the query")
+    t1 = time.perf_counter()
+    r = graph.query(query)
+    t2 = time.perf_counter()
+    print("Query completed in %d !" % (t2 - t1))
+
+    G = rdflib.Graph()
+    G.parse(data=r.serialize(format="n3").decode(), format="n3")
+    G.bind("oda", "http://odahub.io/ontology#")
+    G.bind("odas", "https://odahub.io/ontology#") # the same
+    G.bind("local-renku", f"file://{renku_path}/")
+
+    graph_utils.extract_activity_start_time(G)
+
+    if not no_oda_info:
+        # process oda-related information (eg do the inferring)
+        graph_utils.process_oda_info(G)
+
+    action_node_dict = {}
+    type_label_values_dict = {}
+    args_default_value_dict = {}
+    in_default_value_dict = {}
+    out_default_value_dict = {}
+
+    graph_utils.analyze_inputs(G, in_default_value_dict)
+    graph_utils.analyze_arguments(G, action_node_dict, args_default_value_dict)
+    graph_utils.analyze_outputs(G, out_default_value_dict)
+    graph_utils.analyze_types(G, type_label_values_dict)
+
+    with open('type_label_values_dict.yaml', 'w+') as ft:
+        yaml.dump(type_label_values_dict, ft, allow_unicode=True)
+
+    graph_utils.clean_graph(G)
+
+    stream = io.StringIO()
+    rdf2dot.rdf2dot(G, stream, opts={display})
+    with open('graph.dot', 'w+') as fd:
+        rdf2dot.rdf2dot(G, fd)
+    pydot_graph = pydotplus.graph_from_dot_data(stream.getvalue())
+
+    # pyvis graph
+    net = Network(
+        height='750px', width='100%',
+    )
+    # TODO not fully working yet, needs to investigate
+    # netx = nx.drawing.nx_pydot.read_dot('graph.dot')
+    # net.from_nx(netx)
+
+    graph_utils.set_graph_options(net)
+
+    hidden_nodes_dic = {}
+    hidden_edges = []
+
+    for node in pydot_graph.get_nodes():
+        id_node = graph_utils.get_id_node(node)
+        print("id_node: ", id_node)
+        if id_node is not None and id_node in type_label_values_dict:
+            type_node = type_label_values_dict[id_node]
+            node_label, node_title = graph_utils.get_node_graphical_info(node, type_node)
+            print("node_label: ", node_label)
+            print("node_title: ", node_title)
+            node_configuration = graph_configuration.get(type_node,
+                                                         graph_configuration['Default'])
+            node_value = node_configuration.get('value', graph_configuration['Default']['value'])
+            node_level = node_configuration.get('level', graph_configuration['Default']['level'])
+            hidden = False
+            if type_node.startswith('CommandOutput') or type_node.startswith('CommandInput') \
+                    or type_node.startswith('Angle') or type_node.startswith('Pixels') \
+                    or type_node.startswith('Coordinates') or type_node.startswith('Position') \
+                    or type_node.startswith('SkyCoordinates'):
+                hidden = True
+            if not hidden:
+                net.add_node(node.get_name(),
+                             label=node_label,
+                             title=node_title,
+                             type=type_node,
+                             color=node_configuration['color'],
+                             level=node_level,
+                             shape=node_configuration['shape'],
+                             font={
+                                 'multi': "html",
+                                 'face': "courier"
+                             })
+            else:
+                node_info = dict(
+                    id=node.get_name(),
+                    label=node_label,
+                    title=node_title,
+                    type=type_node,
+                    color=node_configuration['color'],
+                    shape=node_configuration['shape'],
+                    level=node_level,
+                    font={
+                        'multi': "html",
+                        'face': "courier"
+                    }
+                )
+                hidden_nodes_dic[node.get_name()] = node_info
+        # for the png output
+        graph_utils.customize_node(node,
+                                   graph_configuration,
+                                   type_label_values_dict=type_label_values_dict
+                                   )
+
+    # list of edges and simple color change
+    for edge in pydot_graph.get_edge_list():
+        edge_label = graph_utils.get_edge_label(edge)
+        source_node = edge.get_source()
+        dest_node = edge.get_destination()
+        hidden = False
+        edge_id = (source_node + '_' + dest_node)
+        if edge_label.startswith('isInputOf') or edge_label.startswith('hasOutputs') \
+                or edge_label.startswith('isUsing'):
+            hidden = True
+        if source_node is not None and dest_node is not None:
+            if not hidden:
+                net.add_edge(source_node, dest_node,
+                             id=edge_id,
+                             title=edge_label)
+            else:
+                edge_info = dict(
+                    source_node=source_node,
+                    dest_node=dest_node,
+                    id=edge_id,
+                    title=edge_label
+                )
+                hidden_edges.append(edge_info)
+        # for the png putput
+        graph_utils.customize_edge(edge)
+
+    # to tweak physics related options
+    net.write_html(html_fn)
+
+    graph_utils.add_js_click_functionality(net, html_fn, hidden_nodes_dic, hidden_edges)
+
+    graph_utils.update_vis_library_version(html_fn)
+
+    webbrowser.open(html_fn)
+    # final output write over the png image
+    pydot_graph.write_png(filename)
